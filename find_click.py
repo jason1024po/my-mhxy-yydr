@@ -16,133 +16,182 @@ log = logging.getLogger("mhxy")
 pyautogui.FAILSAFE = False
 
 WINDOW_TITLE = "Parallels Desktop"
-CLICK_OFFSET_X = 0
+CLICK_OFFSET_X = 0   # 全局点击偏移，用于补偿游标与实际点击位置的误差
 CLICK_OFFSET_Y = 0
+_SCALE_RANGE = np.arange(0.3, 1.6, 0.05)  # 多尺度匹配的缩放区间
+
+
+# ─── 主流程 ────────────────────────────────────────────────────────────────────
+
+def main():
+    win = get_target_window()
+    if not win:
+        log.warning("⚠️  未找到窗口: %s", WINDOW_TITLE)
+        exit(0)
+    log.info("🖥  窗口 %s  (%d, %d)  %dx%d", WINDOW_TITLE, win["left"], win["top"], win["width"], win["height"])
+
+    # 右键点击英雄，触发上下文菜单
+    match_hero = find_in_window(win, "images/hero.png", debug=True, debug_name="debug_match_hero.png")
+    if not match_hero:
+        log.warning("⚠️  未找到英雄")
+        return False
+    pyautogui.rightClick(*match_hero)
+
+    # 等待「云游道人」出现后点击，再确认购买宝贝
+    while True:
+        if find_and_click(win, "images/yydr.png", confidence=0.5, debug=True, debug_name="debug_match_yydr.png"):
+            time.sleep(0.3)
+            if find_and_click(win, "images/gmbb.png", confidence=0.7, debug=True, debug_name="debug_match_gmbb.png"):
+                break
+            log.warning("⚠️  未找到购买宝贝")
+        else:
+            log.warning("⚠️  未找到「云游道人」")
+            time.sleep(1)
+
+    time.sleep(0.2)
+    for _ in range(3):
+        find_and_click(win, "images/gyms_gj.png", debug=True, debug_name="debug_match_gyms_gj.png", confidence=0.6)
+        time.sleep(0.1)
+        find_and_click(win, "images/queding.png", debug=True, debug_name="debug_match_queding.png", confidence=0.7)
+        time.sleep(0.2)
+
+
+# ─── 窗口 ──────────────────────────────────────────────────────────────────────
 
 def get_target_window():
+    """遍历屏幕上所有窗口，返回匹配 WINDOW_TITLE 且尺寸合法的第一个窗口信息。"""
     options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
-    win_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
-    for win in win_list:
+    for win in Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID):
         name = win.get("kCGWindowName", "") or ""
         owner = win.get("kCGWindowOwnerName", "") or ""
-        if WINDOW_TITLE in owner or WINDOW_TITLE in name:
-            bounds = win.get("kCGWindowBounds")
-            if not bounds:
-                continue
-            w = int(bounds["Width"])
-            h = int(bounds["Height"])
-            if w < 100 or h < 100:
-                continue
+        if WINDOW_TITLE not in owner and WINDOW_TITLE not in name:
+            continue
+        bounds = win.get("kCGWindowBounds")
+        if not bounds:
+            continue
+        w, h = int(bounds["Width"]), int(bounds["Height"])
+        if w >= 100 and h >= 100:
             return {"left": int(bounds["X"]), "top": int(bounds["Y"]), "width": w, "height": h}
     return None
 
+
+# ─── 模板匹配 ──────────────────────────────────────────────────────────────────
+
 def find_in_window(win, template_path, confidence=0.7, debug=False, debug_name="debug_match.png", search_region=None):
-    # 先按窗口截图，后续所有匹配都在这张图上进行。
+    """在窗口截图中用多尺度模板匹配定位目标，返回屏幕坐标 (x, y) 或 None。"""
     screenshot = pyautogui.screenshot(region=(win["left"], win["top"], win["width"], win["height"]))
-    # Retina/缩放场景下，截图像素和窗口坐标可能不一致，用 scale 做坐标换算。
+    # Retina/缩放屏下截图像素与窗口逻辑坐标不等比，scale 用于两者互转
     scale = screenshot.width / win["width"]
     haystack = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
     needle_base = cv2.cvtColor(np.array(Image.open(template_path)), cv2.COLOR_RGB2BGR)
 
-    # ROI 默认是整窗；如果传入 search_region，则收缩到指定搜索范围。
-    roi_left_win = 0
-    roi_top_win = 0
-    roi_right_win = win["width"]
-    roi_bottom_win = win["height"]
-    if search_region:
-        x_min = search_region.get("x_min")
-        x_max = search_region.get("x_max")
-        y_min = search_region.get("y_min")
-        y_max = search_region.get("y_max")
-        if x_min is not None:
-            roi_left_win = max(roi_left_win, int(x_min - win["left"]))
-        if x_max is not None:
-            roi_right_win = min(roi_right_win, int(x_max - win["left"]))
-        if y_min is not None:
-            roi_top_win = max(roi_top_win, int(y_min - win["top"]))
-        if y_max is not None:
-            roi_bottom_win = min(roi_bottom_win, int(y_max - win["top"]))
-
-    # 先在窗口坐标系做有效性校验，避免出现空区域。
-    if roi_left_win >= roi_right_win or roi_top_win >= roi_bottom_win:
-        log.warning("⚠️  %-12s  搜索区域无效", template_path.split("/")[-1])
+    name = _tname(template_path)
+    roi_w = _win_roi(win, search_region)
+    if roi_w is None:
+        log.warning("⚠️  %-12s  搜索区域无效", name)
         return None
 
-    # 将窗口坐标系 ROI 映射到截图像素坐标系。
-    roi_left_shot = max(0, int(round(roi_left_win * scale)))
-    roi_top_shot = max(0, int(round(roi_top_win * scale)))
-    roi_right_shot = min(haystack.shape[1], int(round(roi_right_win * scale)))
-    roi_bottom_shot = min(haystack.shape[0], int(round(roi_bottom_win * scale)))
-    if roi_left_shot >= roi_right_shot or roi_top_shot >= roi_bottom_shot:
-        log.warning("⚠️  %-12s  截图搜索区域无效", template_path.split("/")[-1])
+    roi_s = _shot_roi(roi_w, scale, haystack.shape)
+    if roi_s is None:
+        log.warning("⚠️  %-12s  截图搜索区域无效", name)
         return None
 
-    # 真正参与模板匹配的搜索图。
-    haystack_roi = haystack[roi_top_shot:roi_bottom_shot, roi_left_shot:roi_right_shot]
+    ls, ts, rs, bs = roi_s
+    best_val, roi_loc, best_needle = _multiscale_match(haystack[ts:bs, ls:rs], needle_base)
 
-    best_val = -1
-    best_loc = None
-    best_needle = needle_base
-
-    # 多尺度匹配：遍历模板缩放比例，取置信度最高的一次。
-    for s in np.arange(0.3, 1.6, 0.05):
-        w = int(needle_base.shape[1] * s)
-        h = int(needle_base.shape[0] * s)
-        if w < 10 or h < 10 or w > haystack_roi.shape[1] or h > haystack_roi.shape[0]:
-            continue
-        needle = cv2.resize(needle_base, (w, h))
-        result = cv2.matchTemplate(haystack_roi, needle, cv2.TM_CCOEFF_NORMED)
-        _, val, _, loc = cv2.minMaxLoc(result)
-        if val > best_val:
-            best_val = val
-            # loc 是 ROI 内坐标，转换回整张截图坐标，便于后续统一处理。
-            best_loc = (loc[0] + roi_left_shot, loc[1] + roi_top_shot)
-            best_needle = needle
-
-    if best_loc is None:
-        log.warning("⚠️  %-12s  ROI内未找到可用匹配", template_path.split("/")[-1])
+    if roi_loc is None:
+        log.warning("⚠️  %-12s  ROI内未找到可用匹配", name)
         return None
+
+    # roi_loc 是 ROI 内的局部坐标，加上 ROI 偏移才是截图上的绝对坐标
+    best_loc = (roi_loc[0] + ls, roi_loc[1] + ts)
 
     if debug:
-        # debug 图里：黄框是 ROI，红框是最终匹配框。
-        debug_img = screenshot.copy()
-        draw = ImageDraw.Draw(debug_img)
-        if search_region:
-            draw.rectangle([roi_left_shot, roi_top_shot, roi_right_shot, roi_bottom_shot], outline="yellow", width=2)
-        x1, y1 = best_loc
-        x2 = x1 + best_needle.shape[1]
-        y2 = y1 + best_needle.shape[0]
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-        debug_img.save(debug_name)
+        # 黄框标注搜索区域，红框标注匹配结果
+        _save_debug(screenshot, roi_s if search_region else None, best_loc, best_needle, debug_name)
 
-    name = template_path.split("/")[-1].replace(".png", "")
     if best_val < confidence:
         log.info("❌ %-12s  置信度 %.3f < %.1f  未匹配", name, best_val, confidence)
         return None
     log.info("✅ %-12s  置信度 %.3f", name, best_val)
 
-    # 匹配框中心点（截图坐标）再映射回屏幕坐标，供 pyautogui 点击。
+    # 取匹配框中心，再从截图像素坐标换算回屏幕逻辑坐标
+    cx = best_loc[0] + best_needle.shape[1] / 2
+    cy = best_loc[1] + best_needle.shape[0] / 2
+    return win["left"] + cx / scale, win["top"] + cy / scale
+
+
+def _multiscale_match(haystack_roi, needle_base):
+    """在 _SCALE_RANGE 范围内逐比例缩放模板，返回置信度最高的 (val, loc, needle)。"""
+    best_val, best_loc, best_needle = -1.0, None, needle_base
+    for s in _SCALE_RANGE:
+        w = int(needle_base.shape[1] * s)
+        h = int(needle_base.shape[0] * s)
+        # 模板超出 ROI 或过小时跳过，避免无效匹配
+        if w < 10 or h < 10 or w > haystack_roi.shape[1] or h > haystack_roi.shape[0]:
+            continue
+        needle = cv2.resize(needle_base, (w, h))
+        _, val, _, loc = cv2.minMaxLoc(cv2.matchTemplate(haystack_roi, needle, cv2.TM_CCOEFF_NORMED))
+        if val > best_val:
+            best_val, best_loc, best_needle = val, loc, needle
+    return best_val, best_loc, best_needle
+
+
+def _win_roi(win, search_region):
+    """将 search_region 的屏幕绝对坐标转换为窗口相对坐标，返回 (l, t, r, b) 或 None。"""
+    l, t, r, b = 0, 0, win["width"], win["height"]
+    if search_region:
+        if (v := search_region.get("x_min")) is not None:
+            l = max(l, int(v - win["left"]))
+        if (v := search_region.get("x_max")) is not None:
+            r = min(r, int(v - win["left"]))
+        if (v := search_region.get("y_min")) is not None:
+            t = max(t, int(v - win["top"]))
+        if (v := search_region.get("y_max")) is not None:
+            b = min(b, int(v - win["top"]))
+    return (l, t, r, b) if l < r and t < b else None
+
+
+def _shot_roi(win_roi, scale, h_shape):
+    """将窗口相对坐标 ROI 按 scale 映射到截图像素坐标，返回 (l, t, r, b) 或 None。"""
+    l, t, r, b = win_roi
+    px = lambda v: int(round(v * scale))
+    ls, ts = max(0, px(l)), max(0, px(t))
+    rs, bs = min(h_shape[1], px(r)), min(h_shape[0], px(b))
+    return (ls, ts, rs, bs) if ls < rs and ts < bs else None
+
+
+def _save_debug(screenshot, roi_shot, best_loc, best_needle, debug_name):
+    """将搜索区域（黄框）和匹配结果（红框）绘制到截图上并保存。"""
+    img = screenshot.copy()
+    draw = ImageDraw.Draw(img)
+    if roi_shot:
+        draw.rectangle(list(roi_shot), outline="yellow", width=2)
     x1, y1 = best_loc
-    cx_in_shot = x1 + best_needle.shape[1] / 2
-    cy_in_shot = y1 + best_needle.shape[0] / 2
-    screen_x = win["left"] + cx_in_shot / scale
-    screen_y = win["top"] + cy_in_shot / scale
-    return screen_x, screen_y
+    draw.rectangle([x1, y1, x1 + best_needle.shape[1], y1 + best_needle.shape[0]], outline="red", width=3)
+    img.save(debug_name)
 
 
-def click_match(screen_x, screen_y, move_duration=0.2, click_count=1):
-    target_x = screen_x - CLICK_OFFSET_X
-    target_y = screen_y - CLICK_OFFSET_Y
-    # pyautogui.moveTo(target_x, target_y, duration=move_duration)
+def _tname(path: str) -> str:
+    """从路径中提取不含扩展名的文件名，用于日志展示。"""
+    return path.split("/")[-1].replace(".png", "")
+
+
+# ─── 点击 ──────────────────────────────────────────────────────────────────────
+
+def click_match(screen_x, screen_y, click_count=1):
+    """在指定屏幕坐标点击，支持多次点击。"""
+    x = screen_x - CLICK_OFFSET_X
+    y = screen_y - CLICK_OFFSET_Y
     for i in range(click_count):
-        pyautogui.click(target_x, target_y)
-        log.info("🖱  点击 (%.0f, %.0f)  第 %d/%d 次", target_x, target_y, i + 1, click_count)
+        pyautogui.click(x, y)
+        log.info("🖱  点击 (%.0f, %.0f)  第 %d/%d 次", x, y, i + 1, click_count)
         time.sleep(0.1)
     return True
 
 
-def find_and_click(win, template_path, confidence=0.7, debug=False, debug_name="debug_match.png", move_duration=0.3, click_count=1):
-    # 动态刷新窗口范围，避免游戏切换后坐标漂移
+def find_and_click(win, template_path, confidence=0.7, debug=False, debug_name="debug_match.png", click_count=1):
+    """找到模板后立即点击；每次调用都重新获取窗口位置，防止窗口移动后坐标漂移。"""
     current_win = get_target_window() or win
     if not current_win:
         log.warning("⚠️  未找到窗口: %s", WINDOW_TITLE)
@@ -150,67 +199,10 @@ def find_and_click(win, template_path, confidence=0.7, debug=False, debug_name="
     match = find_in_window(current_win, template_path, confidence=confidence, debug=debug, debug_name=debug_name)
     if not match:
         return False
-    screen_x, screen_y = match
-    return click_match(screen_x, screen_y, move_duration=move_duration, click_count=click_count)
-
-def main():
-    global CLICK_OFFSET_X, CLICK_OFFSET_Y
-    win = get_target_window()
-    if not win:
-        log.warning("⚠️  未找到窗口: %s", WINDOW_TITLE)
-        exit(0)
-    log.info("🖥  窗口 %s  (%d, %d)  %dx%d", WINDOW_TITLE, win["left"], win["top"], win["width"], win["height"])
-
-    match_hero = find_in_window(win, "images/hero.png", debug=True, debug_name="debug_match_hero.png")
-
-    if not match_hero:
-        log.warning("⚠️  未找到英雄")
-        return False
-    hero_screen_x, hero_screen_y = match_hero
-    pyautogui.rightClick(hero_screen_x, hero_screen_y, duration=0.1)
-    
-    # mouse_search_region = {
-    #     "x_min": hero_screen_x,
-    #     "y_max": 2 * hero_screen_y,
-    # }
-    # match_mouse = find_in_window(
-    #     win,
-    #     "images/mouse.png",
-    #     confidence=0.5,
-    #     debug=True,
-    #     debug_name="debug_match_mouse.png",
-    #     search_region=mouse_search_region,
-    # )
-
-    # if not match_mouse:
-    #     log.warning("⚠️  未找到鼠标")
-    #     return False
-    # mouse_screen_x, mouse_screen_y = match_mouse
-
-    # CLICK_OFFSET_X = int(round(mouse_screen_x - hero_screen_x))
-    # CLICK_OFFSET_Y = int(round(mouse_screen_y - hero_screen_y))
-    log.info("📌 全局偏移已更新: x=%d, y=%d", CLICK_OFFSET_X, CLICK_OFFSET_Y)
+    return click_match(*match, click_count=click_count)
 
 
-    
-    while True:
-        if find_and_click(win, "images/yydr.png", confidence=0.5, move_duration=0.4, debug=True, debug_name="debug_match_yydr.png"):
-            time.sleep(0.2)
-            if not find_and_click(win, "images/gmbb.png", confidence=0.7,  debug=True, debug_name="debug_match_gmbb.png"):
-                log.warning("⚠️  未找到购买宝贝")
-                continue
-            else:
-                break
-        else:
-            log.warning("⚠️  未找到「云游道人」")
-            time.sleep(1)
-            continue
-            
-    time.sleep(0.2)
-    find_and_click(win, "images/gyms_gj.png", debug=True, debug_name="debug_match_gyms_gj.png", confidence=0.6)
-    time.sleep(0.1)
-    find_and_click(win, "images/queding.png", debug=True, debug_name="debug_match_queding.png", confidence=0.7)
-    
+# ───────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
